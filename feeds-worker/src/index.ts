@@ -1,5 +1,15 @@
-import express from "express";
-import { getSupabaseAdmin, parser, findImage, isFatalError, getSmartIconUrl, normalizeUrl, itemCanonicalHash, normalizeTitle, nowIso } from "@feedsbar/shared";
+import express, { type Request, type Response } from "express";
+import {
+  getSupabaseAdmin,
+  parser,
+  findImage,
+  isFatalError,
+  getSmartIconUrl,
+  normalizeUrl,
+  itemCanonicalHash,
+  normalizeTitle,
+  nowIso,
+} from "@feedsbar/shared";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -12,17 +22,32 @@ const DEFAULT_POLL_MINUTES = Number(process.env.DEFAULT_POLL_MINUTES || 30);
 
 const supabase = getSupabaseAdmin();
 
-app.get("/health", (_req, res) => res.status(200).send("ok"));
+app.get("/health", (_req: Request, res: Response) => res.status(200).send("ok"));
 
-app.post("/jobs/ingest", async (_req, res) => {
+app.post("/jobs/ingest", async (_req: Request, res: Response) => {
   const started = nowIso();
-  const log: any = { ok: true, started, processed: 0, errors: 0 };
+
+  const log: {
+    ok: boolean;
+    started: string;
+    processed: number;
+    errors: number;
+    errorSamples: Array<{ feedId: string; name?: string; url?: string; error: string }>;
+  } = {
+    ok: true,
+    started,
+    processed: 0,
+    errors: 0,
+    errorSamples: [],
+  };
 
   try {
     // 1) pick due feeds (simple MLP selection)
     const { data: feeds, error: feedsErr } = await supabase
       .from("feeds")
-      .select("id,url,name,icon_url,is_active,last_fetched_at,consecutive_error_count,poll_interval_minutes,next_poll_at,status")
+      .select(
+        "id,url,name,icon_url,is_active,last_fetched_at,consecutive_error_count,poll_interval_minutes,next_poll_at,status"
+      )
       .eq("is_active", true)
       .or("next_poll_at.is.null,next_poll_at.lte.now()")
       .order("next_poll_at", { ascending: true, nullsFirst: true })
@@ -44,16 +69,24 @@ app.post("/jobs/ingest", async (_req, res) => {
           }
         }
 
-        const items = Array.isArray(feedData?.items) ? feedData.items.slice(0, MAX_ITEMS_PER_FEED) : [];
+        const items = Array.isArray(feedData?.items)
+          ? feedData.items.slice(0, MAX_ITEMS_PER_FEED)
+          : [];
 
         // if empty, don’t kill it. just slow it down a bit.
         if (items.length === 0) {
-          const next = minutesFromNow(Math.max(feed.poll_interval_minutes ?? DEFAULT_POLL_MINUTES, 60));
-          await supabase.from("feeds").update({
-            last_polled_at: new Date().toISOString(),
-            next_poll_at: next,
-            status: "degraded"
-          }).eq("id", feed.id);
+          const next = minutesFromNow(
+            Math.max(feed.poll_interval_minutes ?? DEFAULT_POLL_MINUTES, 60)
+          );
+
+          await supabase
+            .from("feeds")
+            .update({
+              last_polled_at: new Date().toISOString(),
+              next_poll_at: next,
+              status: "degraded",
+            })
+            .eq("id", feed.id);
 
           log.processed += 1;
           continue;
@@ -66,7 +99,12 @@ app.post("/jobs/ingest", async (_req, res) => {
           const guid = it?.guid || it?.id || null;
           const canonical_hash = itemCanonicalHash(feed.id, urlNorm, guid);
 
-          const published = it?.isoDate ? new Date(it.isoDate).toISOString() : (it?.pubDate ? new Date(it.pubDate).toISOString() : null);
+          const published = it?.isoDate
+            ? new Date(it.isoDate).toISOString()
+            : it?.pubDate
+            ? new Date(it.pubDate).toISOString()
+            : null;
+
           const published_at = published || new Date().toISOString();
 
           return {
@@ -81,67 +119,104 @@ app.post("/jobs/ingest", async (_req, res) => {
             image_url: findImage(it),
             published_at,
             published_at_corrected: published_at,
-            title_normalized: normalizeTitle(it?.title ?? null)
+            title_normalized: normalizeTitle(it?.title ?? null),
           };
         });
 
         // Supabase upsert
-        const { error: upErr } = await supabase
-          .from("items")
-          .upsert(rows, { onConflict: "canonical_hash" });
+        const { error: upErr } = await supabase.from("items").upsert(rows, {
+          onConflict: "canonical_hash",
+        });
 
         if (upErr) throw upErr;
 
         // feed success + schedule next poll
         const pollMins = feed.poll_interval_minutes ?? DEFAULT_POLL_MINUTES;
-        await supabase.from("feeds").update({
-          last_fetched_at: new Date().toISOString(),
-          last_success_at: new Date().toISOString(),
-          last_polled_at: new Date().toISOString(),
-          consecutive_error_count: 0,
-          status: "active",
-          next_poll_at: minutesFromNow(pollMins)
-        }).eq("id", feed.id);
+
+        await supabase
+          .from("feeds")
+          .update({
+            last_fetched_at: new Date().toISOString(),
+            last_success_at: new Date().toISOString(),
+            last_polled_at: new Date().toISOString(),
+            consecutive_error_count: 0,
+            status: "active",
+            next_poll_at: minutesFromNow(pollMins),
+          })
+          .eq("id", feed.id);
 
         log.processed += 1;
       } catch (err: any) {
         log.errors += 1;
 
+        const msg = err?.message || String(err);
         const fatal = isFatalError(err);
         const nextErrCount = (feed.consecutive_error_count ?? 0) + 1;
 
-        // log error row (feed_id is now NOT NULL)
+        // 1) log to Cloud Run logs (so we can actually see what's going on)
+        console.error(
+          `[ingest] feed failed: ${feed.name || "(no name)"} :: ${feed.url} :: ${
+            fatal ? "fatal" : "transient"
+          } :: ${msg}`
+        );
+
+        // 2) also include a small sample in the response for debugging
+        if (log.errorSamples.length < 20) {
+          log.errorSamples.push({
+            feedId: feed.id,
+            name: feed.name ?? undefined,
+            url: feed.url ?? undefined,
+            error: msg,
+          });
+        }
+
+        // 3) log error row (feed_id is now NOT NULL)
         await supabase.from("feed_errors").insert({
           feed_id: feed.id,
           error_code: fatal ? "fatal" : "transient",
-          error_message: err?.message || String(err),
-          occurred_at: new Date().toISOString()
+          error_message: msg,
+          occurred_at: new Date().toISOString(),
         });
 
-        // backoff
+        // 4) backoff
         const base = feed.poll_interval_minutes ?? DEFAULT_POLL_MINUTES;
-        const backoffMins = fatal ? 24 * 60 : Math.min(360, base * Math.pow(2, Math.min(nextErrCount, 5)));
+        const backoffMins = fatal
+          ? 24 * 60
+          : Math.min(360, base * Math.pow(2, Math.min(nextErrCount, 5)));
+
         const status = fatal || nextErrCount >= 10 ? "broken" : "degraded";
 
-        await supabase.from("feeds").update({
-          consecutive_error_count: nextErrCount,
-          last_error_at: new Date().toISOString(),
-          last_error_code: fatal ? "fatal" : "transient",
-          status,
-          // only hard-disable on truly fatal or long streaks
-          is_active: status === "broken" ? false : true,
-          next_poll_at: minutesFromNow(backoffMins)
-        }).eq("id", feed.id);
+        await supabase
+          .from("feeds")
+          .update({
+            consecutive_error_count: nextErrCount,
+            last_error_at: new Date().toISOString(),
+            last_error_code: fatal ? "fatal" : "transient",
+            status,
+            // only hard-disable on truly fatal or long streaks
+            is_active: status === "broken" ? false : true,
+            next_poll_at: minutesFromNow(backoffMins),
+          })
+          .eq("id", feed.id);
       }
     }
 
-    // retention cleanup (lightweight)
-    await supabase.rpc("delete_old_items", { days: RETENTION_DAYS }).catch(() => null);
+    // retention cleanup (non-blocking)
+    try {
+      await supabase.rpc("delete_old_items", { days: RETENTION_DAYS });
+    } catch (e: any) {
+      console.error(`[ingest] retention rpc failed: ${e?.message || String(e)}`);
+    }
 
-    res.json({ ...log, finished: nowIso() });
+    const finished = nowIso();
+    console.log(`[ingest] done processed=${log.processed} errors=${log.errors}`);
+
+    res.json({ ...log, finished });
   } catch (e: any) {
-    console.error("ingest job failed", e);
-    res.status(500).json({ ok: false, error: e?.message || String(e), started, finished: nowIso() });
+    console.error("[ingest] job failed", e);
+    res
+      .status(500)
+      .json({ ok: false, error: e?.message || String(e), started, finished: nowIso() });
   }
 });
 
@@ -152,4 +227,3 @@ function minutesFromNow(minutes: number) {
 app.listen(Number(PORT), () => {
   console.log(`feeds-worker listening on :${PORT}`);
 });
-

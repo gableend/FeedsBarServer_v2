@@ -1,11 +1,5 @@
 import Parser from "rss-parser";
 
-export type ParsedFeed = {
-  title?: string;
-  link?: string;
-  items?: any[];
-};
-
 export const parser = new Parser({
   timeout: 5000,
   headers: {
@@ -21,25 +15,41 @@ export const parser = new Parser({
   },
 });
 
-export const findImage = (item: any): string | null => {
+/**
+ * EXACT same logic as before, just renamed
+ */
+export function findImage(item: any): string | null {
   if (item?.enclosure?.url) return item.enclosure.url;
 
   if (item?.mediaContent) {
-    if (Array.isArray(item.mediaContent)) return item.mediaContent[0]?.$?.url || null;
-    if (item.mediaContent?.$?.url) return item.mediaContent.$.url;
+    if (Array.isArray(item.mediaContent)) {
+      return item.mediaContent[0]?.$?.url || null;
+    }
+    if (item.mediaContent?.$?.url) {
+      return item.mediaContent.$.url;
+    }
   }
 
   if (item?.itunes?.image) return item.itunes.image;
 
-  const content = item?.contentEncoded || item?.content || item?.description || "";
+  const content =
+    item?.contentEncoded ||
+    item?.content ||
+    item?.description ||
+    "";
+
   const imgMatch = String(content).match(/<img[^>]+src="([^">]+)"/);
   if (imgMatch?.[1]) return imgMatch[1];
 
   return null;
-};
+}
 
-export const isFatalError = (err: any) => {
+/**
+ * EXACT same logic as before, just renamed
+ */
+export function isFatalError(err: any): boolean {
   const msg = (err?.message || String(err)).toLowerCase();
+
   return (
     msg.includes("status code 404") ||
     msg.includes("status code 403") ||
@@ -48,5 +58,4 @@ export const isFatalError = (err: any) => {
     msg.includes("unexpected close tag") ||
     msg.includes("invalid character")
   );
-};
-
+}

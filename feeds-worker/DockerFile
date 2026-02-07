@@ -2,17 +2,12 @@
 FROM node:20-slim AS build
 WORKDIR /repo
 
-# Copy workspace manifests
 COPY package.json package-lock.json* tsconfig.base.json ./
-
-# Copy packages
 COPY shared ./shared
 COPY feeds-worker ./feeds-worker
 
-# Install deps at workspace root
 RUN npm install
 
-# Build shared + worker
 RUN npm run -w @feedsbar/shared build
 RUN npm run -w feeds-worker build
 
@@ -20,11 +15,19 @@ RUN npm run -w feeds-worker build
 FROM node:20-slim
 WORKDIR /app
 
+# App code
 COPY --from=build /repo/feeds-worker/dist ./dist
 COPY --from=build /repo/feeds-worker/package.json ./package.json
-COPY --from=build /repo/feeds-worker/node_modules ./node_modules
+
+# IMPORTANT: copy ROOT node_modules (workspaces hoist deps here, incl. express)
+COPY --from=build /repo/node_modules ./node_modules
+
+# Replace any workspace-linked shared package with the built artifact (no symlinks)
+RUN rm -rf ./node_modules/@feedsbar/shared && mkdir -p ./node_modules/@feedsbar/shared
+COPY --from=build /repo/shared/package.json ./node_modules/@feedsbar/shared/package.json
+COPY --from=build /repo/shared/dist ./node_modules/@feedsbar/shared/dist
+
 
 ENV PORT=8080
 EXPOSE 8080
 CMD ["node","dist/index.js"]
-

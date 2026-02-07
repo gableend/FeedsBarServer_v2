@@ -1,4 +1,4 @@
-export const getSmartIconUrl = async (siteUrl: string): Promise<string> => {
+export async function getSmartIconUrl(siteUrl: string): Promise<string> {
   try {
     const urlObj = new URL(siteUrl);
     const domain = urlObj.hostname
@@ -11,13 +11,10 @@ export const getSmartIconUrl = async (siteUrl: string): Promise<string> => {
     try {
       const res = await fetch(clearbitUrl);
       if (res.status === 200) return clearbitUrl;
-    } catch {
-      // fall through
-    }
+    } catch {}
 
     return `https://icons.duckduckgo.com/ip3/${domain}.ico`;
   } catch {
     return "";
   }
-};
-
+}
