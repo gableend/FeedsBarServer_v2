@@ -1,0 +1,10 @@
+{
+  "name": "feedsbarserver_v2",
+  "private": true,
+  "workspaces": [
+    "shared",
+    "feeds-worker",
+    "feeds-api"
+  ]
+}
+
