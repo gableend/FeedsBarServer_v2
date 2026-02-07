@@ -1,0 +1,12 @@
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-f"
+      - "feeds-worker/Dockerfile"
+      - "-t"
+      - "europe-west1-docker.pkg.dev/$PROJECT_ID/feedsbar/feeds-worker:latest"
+      - "."
+images:
+  - "europe-west1-docker.pkg.dev/$PROJECT_ID/feedsbar/feeds-worker:latest"
+

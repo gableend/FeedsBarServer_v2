@@ -9,7 +9,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "@feedsbar/shared": "workspace:*",
+    "@feedsbar/shared": "file:../shared",
     "@supabase/supabase-js": "^2.49.1",
     "express": "^4.19.2",
     "rss-parser": "^3.13.0"

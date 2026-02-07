@@ -1,20 +1,28 @@
+# Build stage
 FROM node:20-slim AS build
-WORKDIR /app
+WORKDIR /repo
 
-COPY package.json package-lock.json* ./
-COPY ../package.json ../tsconfig.base.json /app/../
-COPY ../shared /app/../shared
-COPY . /app
+# Copy workspace manifests
+COPY package.json package-lock.json* tsconfig.base.json ./
 
+# Copy packages
+COPY shared ./shared
+COPY feeds-worker ./feeds-worker
+
+# Install deps at workspace root
 RUN npm install
-RUN npm run -w @feedsbar/shared build
-RUN npm run build
 
+# Build shared + worker
+RUN npm run -w @feedsbar/shared build
+RUN npm run -w feeds-worker build
+
+# Runtime stage
 FROM node:20-slim
 WORKDIR /app
-COPY --from=build /app/dist ./dist
-COPY --from=build /app/package.json ./package.json
-COPY --from=build /app/node_modules ./node_modules
+
+COPY --from=build /repo/feeds-worker/dist ./dist
+COPY --from=build /repo/feeds-worker/package.json ./package.json
+COPY --from=build /repo/feeds-worker/node_modules ./node_modules
 
 ENV PORT=8080
 EXPOSE 8080
