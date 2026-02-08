@@ -11,6 +11,9 @@ import {
   nowIso,
 } from "@feedsbar/shared";
 
+import { recomputeOrbs } from "./jobs/orbsRecompute";
+
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
@@ -23,6 +26,8 @@ const DEFAULT_POLL_MINUTES = Number(process.env.DEFAULT_POLL_MINUTES || 30);
 const supabase = getSupabaseAdmin();
 
 app.get("/health", (_req: Request, res: Response) => res.status(200).send("ok"));
+
+app.post("/jobs/orbs/recompute", recomputeOrbs);
 
 app.post("/jobs/ingest", async (_req: Request, res: Response) => {
   const started = nowIso();
