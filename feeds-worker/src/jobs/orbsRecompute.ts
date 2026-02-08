@@ -17,7 +17,9 @@ if (!OPENAI_API_KEY) {
 const PROMPT_VERSION = "orbs-words-v1";
 const MODEL = process.env.ORBS_OPENAI_MODEL || "gpt-4o-mini";
 
-// News sentiment palette (tweak)
+// UI safety cap for orb motion (per-hour velocity)
+const VELOCITY_UI_CAP = 5;
+
 const SENTIMENT_COLORS: Record<string, string> = {
   red: "#E24D4D",
   amber: "#F2B233",
@@ -54,6 +56,27 @@ type LabelCandidatesRow = {
   label_input_hash: string;
 };
 
+type OrbRunRow = { id: string };
+
+type OrbSnapshotRow = {
+  output_hash: string | null;
+  keywords: string[] | null;
+};
+
+type OrbLabelRow = {
+  id: string;
+  output_hash: string | null;
+  words: string[] | null;
+  sentiment_label: string | null;
+  generated_at: string;
+  status: "candidate" | "promoted" | "rejected" | "stale";
+};
+
+type PrevStateRow = {
+  volume: number | null;
+  window_end: string;
+};
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
@@ -61,10 +84,18 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
 function alignedWindowEndUtc(date: Date = new Date()): string {
+  // align to 5-min grid
   const ms = date.getTime();
-  const fiveMin = 5 * 60 * 1000;
-  const aligned = new Date(Math.floor(ms / fiveMin) * fiveMin);
+  const step = 5 * 60 * 1000;
+  const aligned = new Date(Math.floor(ms / step) * step);
   return aligned.toISOString();
+}
+
+function clampWindowMinutes(n: number): number {
+  if (!Number.isFinite(n) || n <= 0) return 60;
+  if (n < 5) return 5;
+  if (n > 24 * 60) return 24 * 60;
+  return Math.round(n);
 }
 
 function normalizeTitle(t: string): string {
@@ -88,8 +119,30 @@ function safeThreeWords(raw: string): string[] {
 }
 
 function hashWords(words: string[]): string {
-  const norm = words.map((w: string) => w.trim().toUpperCase()).join("|");
+  const norm = words.map((w) => w.trim().toUpperCase()).join("|");
   return crypto.createHash("sha256").update(norm).digest("hex");
+}
+
+function toIsoOrNull(x: unknown): string | null {
+  if (typeof x !== "string") return null;
+  const d = new Date(x);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function minutesBetweenIso(prevIso: string, curIso: string): number {
+  const a = new Date(prevIso).getTime();
+  const b = new Date(curIso).getTime();
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  const diffMin = (b - a) / 60000;
+  return diffMin;
+}
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function callOpenAIThreeWords(args: {
@@ -161,14 +214,68 @@ ${wantsSentiment ? "Line 2: SENTIMENT: red|amber|green" : ""}`;
   };
 }
 
+type TopicResult = {
+  topic_id: string;
+  ok: boolean;
+
+  volume?: number;
+  diversity?: number;
+
+  // velocity output for debugging + UI understanding
+  velocity?: number; // raw percent delta
+  velocity_per_hour?: number;
+  velocity_snapshot?: number; // capped per-hour used in snapshot
+  elapsed_minutes?: number;
+
+  prev_window_end?: string | null;
+  prev_volume?: number;
+
+  didLabel?: boolean;
+  label_status?: "stale" | "candidate" | "promoted";
+
+  // Debug / observability
+  wantsSentiment?: boolean;
+  window_end?: string;
+  window_minutes?: number;
+
+  cadence_minutes?: number;
+  last_label_attempt_at?: string | null;
+  timeGateOk?: boolean;
+
+  changeGateOk?: boolean;
+  minVolOk?: boolean;
+  firstLabelOk?: boolean;
+  regenOk?: boolean;
+
+  label_attempted?: boolean;
+  cand_count?: number | null;
+  cand_error?: string | null;
+  openai_error?: string | null;
+  openai_retry_attempted?: boolean;
+  openai_retry_succeeded?: boolean;
+  label_insert_error?: string | null;
+
+  stage?: string;
+  error?: string;
+};
+
 export async function recomputeOrbs(req: Request, res: Response) {
   const window_end = alignedWindowEndUtc(new Date());
-  const window_minutes = Number(req.body?.window_minutes ?? 60);
+  const window_minutes = clampWindowMinutes(Number(req.body?.window_minutes ?? 60));
 
-  // 1) Ensure item_categories is incrementally populated (last 2 hours)
-  await supabase.rpc("fn_item_categories_backfill_recent", { p_hours: 2 });
+  // 1) Backfill categories for recent items
+  {
+    const { error } = await supabase.rpc("fn_item_categories_backfill_recent", { p_hours: 2 });
+    if (error) {
+      return res.status(500).json({
+        ok: false,
+        error: "fn_item_categories_backfill_recent failed",
+        details: error.message,
+      });
+    }
+  }
 
-  // 2) Load enabled topics
+  // 2) Enabled topics
   const { data: topicsRaw, error: topicsErr } = await supabase
     .from("topics")
     .select("id,name,slug,orb_color,cadence_minutes,is_enabled,uses_sentiment_color")
@@ -180,7 +287,7 @@ export async function recomputeOrbs(req: Request, res: Response) {
   }
 
   const topics = topicsRaw as TopicRow[];
-  const results: Array<Record<string, unknown>> = [];
+  const results: TopicResult[] = [];
 
   for (const t of topics) {
     const topic_id = t.id;
@@ -188,8 +295,8 @@ export async function recomputeOrbs(req: Request, res: Response) {
     // Sentiment: prefer column, but fall back to slug for now
     const wantsSentiment = Boolean(t.uses_sentiment_color) || t.slug === "news-sentiment";
 
-    // 3) Create run row (per topic)
-    const { data: runRow, error: runErr } = await supabase
+    // 3) Create run row
+    const { data: runRowRaw, error: runErr } = await supabase
       .from("orb_runs")
       .insert({
         topic_id,
@@ -200,17 +307,18 @@ export async function recomputeOrbs(req: Request, res: Response) {
         window_minutes,
         model: MODEL,
       })
-      .select()
+      .select("id")
       .single();
 
-    if (runErr || !runRow) {
-      results.push({ topic_id, ok: false, stage: "run_insert", error: runErr?.message });
+    if (runErr || !runRowRaw) {
+      results.push({ topic_id, ok: false, stage: "run_insert", error: runErr?.message ?? "run insert failed" });
       continue;
     }
-    const run_id = runRow.id as string;
+
+    const run_id = (runRowRaw as OrbRunRow).id;
 
     try {
-      // 4) State calc (RPC)
+      // 4) Calc state (RPC)
       const { data: stateRowsRaw, error: stateErr } = await supabase.rpc("fn_orb_state_calc", {
         p_topic_id: topic_id,
         p_window_end: window_end,
@@ -227,16 +335,46 @@ export async function recomputeOrbs(req: Request, res: Response) {
       const top_items = state.top_items ?? [];
       const state_hash = state.input_hash;
 
-      // 5) Upsert orb_state
-      await supabase
+      // 5) Find previous actual orb_state row (most recent prior window_end)
+      const { data: prevStateRaw, error: prevErr } = await supabase
         .from("orb_state")
-        .upsert(
+        .select("volume, window_end")
+        .eq("topic_id", topic_id)
+        .eq("window_minutes", window_minutes)
+        .lt("window_end", window_end)
+        .order("window_end", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (prevErr) throw new Error(`prev state lookup failed: ${prevErr.message}`);
+
+      const prevState = (prevStateRaw ?? null) as PrevStateRow | null;
+      const prevVol = Number(prevState?.volume ?? 0);
+      const prev_window_end = toIsoOrNull(prevState?.window_end ?? null);
+
+      const elapsed_minutes =
+        prev_window_end !== null ? minutesBetweenIso(prev_window_end, window_end) : 0;
+
+      // Raw velocity (percent change vs prevVol)
+      const velocity_raw = prevVol > 0 ? (volume - prevVol) / prevVol : 0;
+
+      // Time-normalized velocity (per hour)
+      const denom = elapsed_minutes > 0 ? elapsed_minutes : 0;
+      const velocity_per_hour = denom > 0 ? velocity_raw * (60 / denom) : 0;
+
+      // UI velocity (capped per-hour) for snapshots
+      const velocity_snapshot = clamp(velocity_per_hour, -VELOCITY_UI_CAP, VELOCITY_UI_CAP);
+
+      // 6) Upsert orb_state (single write, includes both velocities)
+      {
+        const { error } = await supabase.from("orb_state").upsert(
           {
             topic_id,
             window_end,
             window_minutes,
             volume,
-            velocity: 0,
+            velocity: velocity_raw,
+            velocity_per_hour,
             diversity,
             top_sources,
             top_items,
@@ -247,35 +385,21 @@ export async function recomputeOrbs(req: Request, res: Response) {
           { onConflict: "topic_id,window_end,window_minutes" }
         );
 
-      // Velocity vs previous window (will be 0 until previous window exists)
-      const prev_end = new Date(new Date(window_end).getTime() - window_minutes * 60 * 1000).toISOString();
-      const { data: prevState } = await supabase
-        .from("orb_state")
-        .select("volume")
-        .eq("topic_id", topic_id)
-        .eq("window_end", prev_end)
-        .eq("window_minutes", window_minutes)
-        .maybeSingle();
+        if (error) throw new Error(`orb_state upsert failed: ${error.message}`);
+      }
 
-      const prevVol = Number((prevState as { volume?: number } | null)?.volume ?? 0);
-      const velocity = prevVol > 0 ? (volume - prevVol) / Math.max(prevVol, 1) : 0;
-
-      await supabase
-        .from("orb_state")
-        .update({ velocity })
-        .eq("topic_id", topic_id)
-        .eq("window_end", window_end)
-        .eq("window_minutes", window_minutes);
-
-      // 6) Determine whether to regen label
-      const { data: snap } = await supabase
+      // 7) Snapshot load
+      const { data: snapRaw, error: snapErr } = await supabase
         .from("orb_snapshots")
         .select("output_hash, keywords")
         .eq("topic_id", topic_id)
         .maybeSingle();
 
-      // Use orb_labels as the label cadence clock (NOT orb_snapshots.updated_at)
-      const { data: lastLabelAttempt } = await supabase
+      if (snapErr) throw new Error(`snapshot load failed: ${snapErr.message}`);
+      const snap = (snapRaw ?? null) as OrbSnapshotRow | null;
+
+      // 8) Label cadence clock uses orb_labels.generated_at
+      const { data: lastLabelAttemptRaw, error: lastLabelErr } = await supabase
         .from("orb_labels")
         .select("generated_at")
         .eq("topic_id", topic_id)
@@ -283,34 +407,44 @@ export async function recomputeOrbs(req: Request, res: Response) {
         .limit(1)
         .maybeSingle();
 
+      if (lastLabelErr) throw new Error(`last label attempt lookup failed: ${lastLabelErr.message}`);
+
       const cadenceMin = Number(t.cadence_minutes ?? 30);
-      const lastAttemptMs = lastLabelAttempt?.generated_at
-        ? new Date(lastLabelAttempt.generated_at).getTime()
+      const lastAttemptIso = lastLabelAttemptRaw?.generated_at
+        ? new Date(lastLabelAttemptRaw.generated_at).toISOString()
+        : null;
+
+      const lastAttemptMs = lastLabelAttemptRaw?.generated_at
+        ? new Date(lastLabelAttemptRaw.generated_at).getTime()
         : 0;
 
       const timeGateOk = !lastAttemptMs || Date.now() - lastAttemptMs >= cadenceMin * 60 * 1000;
 
+      // Change gate uses RAW velocity (keeps previous behavior stable)
+      const absVel = Math.abs(velocity_raw);
+
       const changeGateOk =
-        Math.abs(velocity) >= 0.35 ||
-        (volume >= 30 && prevVol > 0 && Math.abs(volume - prevVol) / Math.max(prevVol, 1) >= 0.25);
+        absVel >= 0.35 ||
+        (volume >= 30 && prevVol > 0 && Math.abs(volume - prevVol) / prevVol >= 0.25);
 
       const minVolOk = volume >= 12;
 
-      // Latest promoted label (if any)
-      const { data: promotedExisting } = await supabase
+      // 9) Find latest promoted label (if any)
+      const { data: promotedExistingRaw, error: promotedErr } = await supabase
         .from("orb_labels")
-        .select("id, output_hash, words, sentiment_label")
+        .select("id, output_hash, words, sentiment_label, generated_at, status")
         .eq("topic_id", topic_id)
         .eq("status", "promoted")
         .order("generated_at", { ascending: false })
         .limit(1)
         .maybeSingle();
 
-      const hasPromoted = Boolean(promotedExisting);
+      if (promotedErr) throw new Error(`promoted label lookup failed: ${promotedErr.message}`);
 
-      // Rules:
-      // - First label: only needs timeGate + volume>=10 (bootstrap)
-      // - Subsequent labels: timeGate + (changeGate & minVol)
+      const promotedExisting = (promotedExistingRaw ?? null) as OrbLabelRow | null;
+      const hasPromoted = Boolean(promotedExisting?.id);
+
+      // First label promotes immediately if no promoted exists yet
       const firstLabelOk = !hasPromoted && timeGateOk && volume >= 10;
       const regenOk = hasPromoted && timeGateOk && changeGateOk && minVolOk;
 
@@ -318,98 +452,161 @@ export async function recomputeOrbs(req: Request, res: Response) {
       let label_status: "stale" | "candidate" | "promoted" = "stale";
       let promotedWords: string[] | null = null;
       let sentiment_label: string | null = null;
-      let output_hash: string | null = (snap as { output_hash?: string } | null)?.output_hash ?? null;
+      let output_hash: string | null = snap?.output_hash ?? null;
 
+      // Debug labeling counters
+      let label_attempted = false;
+      let cand_count: number | null = null;
+      let cand_error: string | null = null;
+      let openai_error: string | null = null;
+      let openai_retry_attempted = false;
+      let openai_retry_succeeded = false;
+      let run_token_estimate: number | null = null;
+      let label_insert_error: string | null = null;
+
+      // 10) Labeling attempt
       if (firstLabelOk || regenOk) {
-        // 7) Candidate selection
+        label_attempted = true;
+
         const { data: candRowsRaw, error: candErr } = await supabase.rpc("fn_orb_label_candidates", {
           p_topic_id: topic_id,
           p_window_end: window_end,
           p_window_minutes: window_minutes,
           p_max_items: 15,
-          p_max_per_feed: 2,
+          p_max_per_feed: hasPromoted ? 2 : 3,
         });
 
+        cand_error = candErr?.message ?? null;
+
         const candRows = (candRowsRaw ?? []) as LabelCandidatesRow[];
+        const cand = candRows[0] ?? null;
 
-        if (!candErr && candRows[0]) {
-          const cand = candRows[0];
+        if (!candErr && cand) {
           const items = (cand.items ?? []) as LabelCandidateItem[];
+          cand_count = items.length;
+
           const label_input_hash = cand.label_input_hash;
-
           const minItems = hasPromoted ? 8 : 6;
-if (items.length >= minItems) {
 
-            // 8) OpenAI call
-            const ai = await callOpenAIThreeWords({
-              topicName: t.name,
-              topicSlug: t.slug,
-              items,
-              wantsSentiment,
-            });
+          if (items.length >= minItems) {
+            // OpenAI call (retry once with small backoff)
+            let ai: Awaited<ReturnType<typeof callOpenAIThreeWords>> | null = null;
+            try {
+              ai = await callOpenAIThreeWords({
+                topicName: t.name,
+                topicSlug: t.slug,
+                items,
+                wantsSentiment,
+              });
+            } catch (e1: unknown) {
+              openai_error = e1 instanceof Error ? e1.message : String(e1);
+              openai_retry_attempted = true;
+              await sleep(600);
+              try {
+                ai = await callOpenAIThreeWords({
+                  topicName: t.name,
+                  topicSlug: t.slug,
+                  items,
+                  wantsSentiment,
+                });
+                openai_retry_succeeded = true;
+                openai_error = null;
+              } catch (e2: unknown) {
+                const msg2 = e2 instanceof Error ? e2.message : String(e2);
+                openai_error = `${openai_error}; retry_failed: ${msg2}`;
+              }
+            }
 
-            const words = ai.words;
-            const outHash = hashWords(words);
+            if (ai) {
+              run_token_estimate = ai.token_estimate;
+              const words = ai.words;
+              const outHash = hashWords(words);
 
-            // 9) Insert candidate label
-            const ins = await supabase.from("orb_labels").insert({
-              topic_id,
-              window_end,
-              window_minutes,
-              words,
-              summary: null,
-              sentiment_label: ai.sentiment_label,
-              sentiment_score: null,
-              input_hash: label_input_hash,
-              output_hash: outHash,
-              model: MODEL,
-              prompt_version: PROMPT_VERSION,
-              status: "candidate",
-              run_id,
-            });
+              const ins = await supabase.from("orb_labels").insert({
+                topic_id,
+                window_end,
+                window_minutes,
+                words,
+                summary: null,
+                sentiment_label: ai.sentiment_label,
+                sentiment_score: null,
+                input_hash: label_input_hash,
+                output_hash: outHash,
+                model: MODEL,
+                prompt_version: PROMPT_VERSION,
+                status: "candidate",
+                run_id,
+              });
 
-            if (!ins.error) {
-              didLabel = true;
+              label_insert_error = ins.error?.message ?? null;
 
-              if (!hasPromoted) {
-                // First-ever label: promote immediately
-                const { data: newest } = await supabase
-                  .from("orb_labels")
-                  .select("id")
-                  .eq("topic_id", topic_id)
-                  .order("generated_at", { ascending: false })
-                  .limit(1)
-                  .maybeSingle();
+              if (!ins.error) {
+                didLabel = true;
 
-                if (newest?.id) {
-                  await supabase.from("orb_labels").update({ status: "promoted" }).eq("id", newest.id);
-                }
+                if (!hasPromoted) {
+                  // Bootstrap: promote immediately
+                  const { data: newestRaw, error: newestErr } = await supabase
+                    .from("orb_labels")
+                    .select("id")
+                    .eq("topic_id", topic_id)
+                    .order("generated_at", { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
 
-                promotedWords = words;
-                sentiment_label = ai.sentiment_label;
-                output_hash = outHash;
-                label_status = "promoted";
-              } else {
-                // Existing behavior: promote only after stability (2 consecutive same hashes)
-                const { data: lastTwo } = await supabase
-                  .from("orb_labels")
-                  .select("id, output_hash")
-                  .eq("topic_id", topic_id)
-                  .order("generated_at", { ascending: false })
-                  .limit(2);
+                  if (newestErr) throw new Error(`newest label lookup failed: ${newestErr.message}`);
 
-                const last = (lastTwo ?? []) as Array<{ id: string; output_hash: string }>;
+                  const newestId = (newestRaw as { id?: string } | null)?.id ?? null;
+                  if (newestId) {
+                    const { error: promoteErr2 } = await supabase
+                      .from("orb_labels")
+                      .update({ status: "promoted" })
+                      .eq("id", newestId);
 
-                if (last.length === 2 && last[0].output_hash === last[1].output_hash) {
-                  await supabase.from("orb_labels").update({ status: "promoted" }).eq("id", last[0].id);
-                  await supabase.from("orb_labels").update({ status: "rejected" }).eq("id", last[1].id);
+                    if (promoteErr2) throw new Error(`bootstrap promote failed: ${promoteErr2.message}`);
+                  }
 
                   promotedWords = words;
                   sentiment_label = ai.sentiment_label;
                   output_hash = outHash;
                   label_status = "promoted";
                 } else {
-                  label_status = "candidate";
+                  // Stability rule: promote after two consecutive same hashes
+                  const { data: lastTwoRaw, error: lastTwoErr } = await supabase
+                    .from("orb_labels")
+                    .select("id,output_hash")
+                    .eq("topic_id", topic_id)
+                    .order("generated_at", { ascending: false })
+                    .limit(2);
+
+                  if (lastTwoErr) throw new Error(`lastTwo label lookup failed: ${lastTwoErr.message}`);
+
+                  const last = (lastTwoRaw ?? []) as Array<{ id: string; output_hash: string | null }>;
+                  const h0 = last[0]?.output_hash ?? null;
+                  const h1 = last[1]?.output_hash ?? null;
+
+                  if (last.length === 2 && h0 && h1 && h0 === h1) {
+                    const { error: promoteErr } = await supabase
+                      .from("orb_labels")
+                      .update({ status: "promoted" })
+                      .eq("id", last[0].id);
+
+                    if (promoteErr) throw new Error(`promote failed: ${promoteErr.message}`);
+
+                    // If hashes match, the prior row was just superseded. Mark as stale (not rejected).
+                    const { error: staleErr } = await supabase
+                      .from("orb_labels")
+                      .update({ status: "stale" })
+                      .eq("id", last[1].id);
+
+                    if (staleErr) throw new Error(`stale failed: ${staleErr.message}`);
+
+                    promotedWords = words;
+                    sentiment_label = ai.sentiment_label;
+                    output_hash = outHash;
+                    label_status = "promoted";
+                  } else {
+                    label_status = "candidate";
+                  }
                 }
               }
             }
@@ -417,18 +614,12 @@ if (items.length >= minItems) {
         }
       }
 
-      // 11) Load latest promoted label if none promoted this run
-      if (!promotedWords) {
-        const p = promotedExisting as
-          | { words?: string[]; sentiment_label?: string | null; output_hash?: string | null }
-          | null;
-
-        if (p?.words?.length === 3) {
-          promotedWords = p.words;
-          sentiment_label = p.sentiment_label ?? null;
-          output_hash = p.output_hash ?? output_hash;
-          label_status = "promoted";
-        }
+      // 11) Load promoted label if none promoted this run
+      if (!promotedWords && promotedExisting?.words && promotedExisting.words.length === 3) {
+        promotedWords = promotedExisting.words;
+        sentiment_label = promotedExisting.sentiment_label ?? null;
+        output_hash = promotedExisting.output_hash ?? output_hash;
+        label_status = "promoted";
       }
 
       const resting_color = t.orb_color ?? "#999999";
@@ -439,12 +630,14 @@ if (items.length >= minItems) {
         : resting_color;
 
       // 12) Upsert snapshot for UI
-      await supabase
-        .from("orb_snapshots")
-        .upsert(
+      {
+        const keywordsFallback = Array.isArray(snap?.keywords) ? snap!.keywords! : [];
+        const keywordsToWrite = promotedWords ?? keywordsFallback;
+
+        const { error } = await supabase.from("orb_snapshots").upsert(
           {
             topic_id,
-            keywords: promotedWords ?? ((snap as { keywords?: string[] } | null)?.keywords ?? []),
+            keywords: keywordsToWrite,
             sentiment_label,
             sentiment_score: null,
             summary: null,
@@ -453,7 +646,8 @@ if (items.length >= minItems) {
             window_end,
             window_minutes,
             volume,
-            velocity,
+            // IMPORTANT: snapshot gets UI-friendly capped per-hour velocity
+            velocity: velocity_snapshot,
             diversity,
             top_sources,
             top_items,
@@ -465,18 +659,62 @@ if (items.length >= minItems) {
           { onConflict: "topic_id" }
         );
 
-      // 13) Finish run
-      await supabase
-        .from("orb_runs")
-        .update({
-          status: "ok",
-          output_hash,
-          token_estimate: null,
-          finished_at: new Date().toISOString(),
-        })
-        .eq("id", run_id);
+        if (error) throw new Error(`snapshot upsert failed: ${error.message}`);
+      }
 
-      results.push({ topic_id, ok: true, volume, diversity, velocity, didLabel, label_status });
+      // 13) Finish run
+      {
+        const { error } = await supabase
+          .from("orb_runs")
+          .update({
+            status: "ok",
+            output_hash,
+            token_estimate: run_token_estimate,
+            finished_at: new Date().toISOString(),
+          })
+          .eq("id", run_id);
+
+        if (error) throw new Error(`orb_runs update failed: ${error.message}`);
+      }
+
+      results.push({
+        topic_id,
+        ok: true,
+        window_end,
+        window_minutes,
+        wantsSentiment,
+
+        volume,
+        diversity,
+
+        velocity: velocity_raw,
+        velocity_per_hour,
+        velocity_snapshot,
+        elapsed_minutes,
+
+        prev_window_end,
+        prev_volume: prevVol,
+
+        cadence_minutes: cadenceMin,
+        last_label_attempt_at: lastAttemptIso,
+        timeGateOk,
+
+        changeGateOk,
+        minVolOk,
+        firstLabelOk,
+        regenOk,
+
+        didLabel,
+        label_status,
+
+        label_attempted,
+        cand_count,
+        cand_error,
+        openai_error,
+        openai_retry_attempted,
+        openai_retry_succeeded,
+        label_insert_error,
+      });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
 
