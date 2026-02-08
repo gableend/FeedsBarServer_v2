@@ -270,16 +270,25 @@ export async function recomputeOrbs(req: Request, res: Response) {
       // 6) Determine whether to regen label
       const { data: snap } = await supabase
         .from("orb_snapshots")
-        .select("updated_at, output_hash, keywords")
+        .select("output_hash, keywords")
         .eq("topic_id", topic_id)
         .maybeSingle();
 
+      // Use orb_labels as the label cadence clock (NOT orb_snapshots.updated_at)
+      const { data: lastLabelAttempt } = await supabase
+        .from("orb_labels")
+        .select("generated_at")
+        .eq("topic_id", topic_id)
+        .order("generated_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
       const cadenceMin = Number(t.cadence_minutes ?? 30);
-      const lastUpdatedMs = (snap as { updated_at?: string } | null)?.updated_at
-        ? new Date((snap as { updated_at: string }).updated_at).getTime()
+      const lastAttemptMs = lastLabelAttempt?.generated_at
+        ? new Date(lastLabelAttempt.generated_at).getTime()
         : 0;
 
-      const timeGateOk = !lastUpdatedMs || Date.now() - lastUpdatedMs >= cadenceMin * 60 * 1000;
+      const timeGateOk = !lastAttemptMs || Date.now() - lastAttemptMs >= cadenceMin * 60 * 1000;
 
       const changeGateOk =
         Math.abs(velocity) >= 0.35 ||
@@ -287,10 +296,10 @@ export async function recomputeOrbs(req: Request, res: Response) {
 
       const minVolOk = volume >= 12;
 
-      // NEW: detect whether we already have a promoted label
+      // Latest promoted label (if any)
       const { data: promotedExisting } = await supabase
         .from("orb_labels")
-        .select("id,output_hash,words,sentiment_label")
+        .select("id, output_hash, words, sentiment_label")
         .eq("topic_id", topic_id)
         .eq("status", "promoted")
         .order("generated_at", { ascending: false })
@@ -299,7 +308,9 @@ export async function recomputeOrbs(req: Request, res: Response) {
 
       const hasPromoted = Boolean(promotedExisting);
 
-      // NEW: first-label rule (get *something* on screen)
+      // Rules:
+      // - First label: only needs timeGate + volume>=10 (bootstrap)
+      // - Subsequent labels: timeGate + (changeGate & minVol)
       const firstLabelOk = !hasPromoted && timeGateOk && volume >= 10;
       const regenOk = hasPromoted && timeGateOk && changeGateOk && minVolOk;
 
@@ -326,7 +337,9 @@ export async function recomputeOrbs(req: Request, res: Response) {
           const items = (cand.items ?? []) as LabelCandidateItem[];
           const label_input_hash = cand.label_input_hash;
 
-          if (items.length >= 8) {
+          const minItems = hasPromoted ? 8 : 6;
+if (items.length >= minItems) {
+
             // 8) OpenAI call
             const ai = await callOpenAIThreeWords({
               topicName: t.name,
@@ -358,9 +371,8 @@ export async function recomputeOrbs(req: Request, res: Response) {
             if (!ins.error) {
               didLabel = true;
 
-              // NEW: first ever label promotes immediately
               if (!hasPromoted) {
-                // Promote the just-created candidate
+                // First-ever label: promote immediately
                 const { data: newest } = await supabase
                   .from("orb_labels")
                   .select("id")
@@ -381,7 +393,7 @@ export async function recomputeOrbs(req: Request, res: Response) {
                 // Existing behavior: promote only after stability (2 consecutive same hashes)
                 const { data: lastTwo } = await supabase
                   .from("orb_labels")
-                  .select("id,output_hash")
+                  .select("id, output_hash")
                   .eq("topic_id", topic_id)
                   .order("generated_at", { ascending: false })
                   .limit(2);
