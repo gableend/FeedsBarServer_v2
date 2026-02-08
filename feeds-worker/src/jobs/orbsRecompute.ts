@@ -184,7 +184,9 @@ export async function recomputeOrbs(req: Request, res: Response) {
 
   for (const t of topics) {
     const topic_id = t.id;
-    const wantsSentiment = Boolean(t.uses_sentiment_color);
+
+    // Sentiment: prefer column, but fall back to slug for now
+    const wantsSentiment = Boolean(t.uses_sentiment_color) || t.slug === "news-sentiment";
 
     // 3) Create run row (per topic)
     const { data: runRow, error: runErr } = await supabase
@@ -245,7 +247,7 @@ export async function recomputeOrbs(req: Request, res: Response) {
           { onConflict: "topic_id,window_end,window_minutes" }
         );
 
-      // Velocity vs previous window
+      // Velocity vs previous window (will be 0 until previous window exists)
       const prev_end = new Date(new Date(window_end).getTime() - window_minutes * 60 * 1000).toISOString();
       const { data: prevState } = await supabase
         .from("orb_state")
@@ -285,13 +287,29 @@ export async function recomputeOrbs(req: Request, res: Response) {
 
       const minVolOk = volume >= 12;
 
+      // NEW: detect whether we already have a promoted label
+      const { data: promotedExisting } = await supabase
+        .from("orb_labels")
+        .select("id,output_hash,words,sentiment_label")
+        .eq("topic_id", topic_id)
+        .eq("status", "promoted")
+        .order("generated_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const hasPromoted = Boolean(promotedExisting);
+
+      // NEW: first-label rule (get *something* on screen)
+      const firstLabelOk = !hasPromoted && timeGateOk && volume >= 10;
+      const regenOk = hasPromoted && timeGateOk && changeGateOk && minVolOk;
+
       let didLabel = false;
       let label_status: "stale" | "candidate" | "promoted" = "stale";
       let promotedWords: string[] | null = null;
       let sentiment_label: string | null = null;
       let output_hash: string | null = (snap as { output_hash?: string } | null)?.output_hash ?? null;
 
-      if (timeGateOk && changeGateOk && minVolOk) {
+      if (firstLabelOk || regenOk) {
         // 7) Candidate selection
         const { data: candRowsRaw, error: candErr } = await supabase.rpc("fn_orb_label_candidates", {
           p_topic_id: topic_id,
@@ -340,26 +358,47 @@ export async function recomputeOrbs(req: Request, res: Response) {
             if (!ins.error) {
               didLabel = true;
 
-              // 10) Promotion: two consecutive same hashes
-              const { data: lastTwo } = await supabase
-                .from("orb_labels")
-                .select("id,output_hash")
-                .eq("topic_id", topic_id)
-                .order("generated_at", { ascending: false })
-                .limit(2);
+              // NEW: first ever label promotes immediately
+              if (!hasPromoted) {
+                // Promote the just-created candidate
+                const { data: newest } = await supabase
+                  .from("orb_labels")
+                  .select("id")
+                  .eq("topic_id", topic_id)
+                  .order("generated_at", { ascending: false })
+                  .limit(1)
+                  .maybeSingle();
 
-              const last = (lastTwo ?? []) as Array<{ id: string; output_hash: string }>;
-
-              if (last.length === 2 && last[0].output_hash === last[1].output_hash) {
-                await supabase.from("orb_labels").update({ status: "promoted" }).eq("id", last[0].id);
-                await supabase.from("orb_labels").update({ status: "rejected" }).eq("id", last[1].id);
+                if (newest?.id) {
+                  await supabase.from("orb_labels").update({ status: "promoted" }).eq("id", newest.id);
+                }
 
                 promotedWords = words;
                 sentiment_label = ai.sentiment_label;
                 output_hash = outHash;
                 label_status = "promoted";
               } else {
-                label_status = "candidate";
+                // Existing behavior: promote only after stability (2 consecutive same hashes)
+                const { data: lastTwo } = await supabase
+                  .from("orb_labels")
+                  .select("id,output_hash")
+                  .eq("topic_id", topic_id)
+                  .order("generated_at", { ascending: false })
+                  .limit(2);
+
+                const last = (lastTwo ?? []) as Array<{ id: string; output_hash: string }>;
+
+                if (last.length === 2 && last[0].output_hash === last[1].output_hash) {
+                  await supabase.from("orb_labels").update({ status: "promoted" }).eq("id", last[0].id);
+                  await supabase.from("orb_labels").update({ status: "rejected" }).eq("id", last[1].id);
+
+                  promotedWords = words;
+                  sentiment_label = ai.sentiment_label;
+                  output_hash = outHash;
+                  label_status = "promoted";
+                } else {
+                  label_status = "candidate";
+                }
               }
             }
           }
@@ -368,16 +407,10 @@ export async function recomputeOrbs(req: Request, res: Response) {
 
       // 11) Load latest promoted label if none promoted this run
       if (!promotedWords) {
-        const { data: prom } = await supabase
-          .from("orb_labels")
-          .select("words,sentiment_label,output_hash")
-          .eq("topic_id", topic_id)
-          .eq("status", "promoted")
-          .order("generated_at", { ascending: false })
-          .limit(1)
-          .maybeSingle();
+        const p = promotedExisting as
+          | { words?: string[]; sentiment_label?: string | null; output_hash?: string | null }
+          | null;
 
-        const p = prom as { words?: string[]; sentiment_label?: string | null; output_hash?: string | null } | null;
         if (p?.words?.length === 3) {
           promotedWords = p.words;
           sentiment_label = p.sentiment_label ?? null;

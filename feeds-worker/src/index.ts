@@ -11,7 +11,8 @@ import {
   nowIso,
 } from "@feedsbar/shared";
 
-import { recomputeOrbs } from "./jobs/orbsRecompute";
+import { recomputeOrbs } from "./jobs/orbsRecompute.js";
+
 
 
 const app = express();
