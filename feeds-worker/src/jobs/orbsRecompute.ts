@@ -77,6 +77,11 @@ type PrevStateRow = {
   window_end: string;
 };
 
+type LastLabelInputRow = {
+  input_hash: string | null;
+  generated_at: string;
+};
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
@@ -133,8 +138,7 @@ function minutesBetweenIso(prevIso: string, curIso: string): number {
   const a = new Date(prevIso).getTime();
   const b = new Date(curIso).getTime();
   if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
-  const diffMin = (b - a) / 60000;
-  return diffMin;
+  return (b - a) / 60000;
 }
 
 function clamp(n: number, min: number, max: number): number {
@@ -255,6 +259,12 @@ type TopicResult = {
   openai_retry_succeeded?: boolean;
   label_insert_error?: string | null;
 
+  // Defensive label cost controls
+  label_input_hash_current?: string | null;
+  label_input_hash_prev?: string | null;
+  label_input_hash_changed?: boolean | null;
+  label_skip_reason?: string | null;
+
   stage?: string;
   error?: string;
 };
@@ -311,7 +321,12 @@ export async function recomputeOrbs(req: Request, res: Response) {
       .single();
 
     if (runErr || !runRowRaw) {
-      results.push({ topic_id, ok: false, stage: "run_insert", error: runErr?.message ?? "run insert failed" });
+      results.push({
+        topic_id,
+        ok: false,
+        stage: "run_insert",
+        error: runErr?.message ?? "run insert failed",
+      });
       continue;
     }
 
@@ -352,15 +367,13 @@ export async function recomputeOrbs(req: Request, res: Response) {
       const prevVol = Number(prevState?.volume ?? 0);
       const prev_window_end = toIsoOrNull(prevState?.window_end ?? null);
 
-      const elapsed_minutes =
-        prev_window_end !== null ? minutesBetweenIso(prev_window_end, window_end) : 0;
+      const elapsed_minutes = prev_window_end !== null ? minutesBetweenIso(prev_window_end, window_end) : 0;
 
       // Raw velocity (percent change vs prevVol)
       const velocity_raw = prevVol > 0 ? (volume - prevVol) / prevVol : 0;
 
       // Time-normalized velocity (per hour)
-      const denom = elapsed_minutes > 0 ? elapsed_minutes : 0;
-      const velocity_per_hour = denom > 0 ? velocity_raw * (60 / denom) : 0;
+      const velocity_per_hour = elapsed_minutes > 0 ? velocity_raw * (60 / elapsed_minutes) : 0;
 
       // UI velocity (capped per-hour) for snapshots
       const velocity_snapshot = clamp(velocity_per_hour, -VELOCITY_UI_CAP, VELOCITY_UI_CAP);
@@ -414,15 +427,11 @@ export async function recomputeOrbs(req: Request, res: Response) {
         ? new Date(lastLabelAttemptRaw.generated_at).toISOString()
         : null;
 
-      const lastAttemptMs = lastLabelAttemptRaw?.generated_at
-        ? new Date(lastLabelAttemptRaw.generated_at).getTime()
-        : 0;
-
+      const lastAttemptMs = lastLabelAttemptRaw?.generated_at ? new Date(lastLabelAttemptRaw.generated_at).getTime() : 0;
       const timeGateOk = !lastAttemptMs || Date.now() - lastAttemptMs >= cadenceMin * 60 * 1000;
 
       // Change gate uses RAW velocity (keeps previous behavior stable)
       const absVel = Math.abs(velocity_raw);
-
       const changeGateOk =
         absVel >= 0.35 ||
         (volume >= 30 && prevVol > 0 && Math.abs(volume - prevVol) / prevVol >= 0.25);
@@ -464,6 +473,12 @@ export async function recomputeOrbs(req: Request, res: Response) {
       let run_token_estimate: number | null = null;
       let label_insert_error: string | null = null;
 
+      // Defensive label cost controls
+      let label_input_hash_current: string | null = null;
+      let label_input_hash_prev: string | null = null;
+      let label_input_hash_changed: boolean | null = null;
+      let label_skip_reason: string | null = null;
+
       // 10) Labeling attempt
       if (firstLabelOk || regenOk) {
         label_attempted = true;
@@ -486,9 +501,34 @@ export async function recomputeOrbs(req: Request, res: Response) {
           cand_count = items.length;
 
           const label_input_hash = cand.label_input_hash;
+          label_input_hash_current = label_input_hash;
+
+          // Look up last label attempt input_hash. If unchanged, skip OpenAI.
+          const { data: lastLabelInputRaw, error: lastLabelInputErr } = await supabase
+            .from("orb_labels")
+            .select("input_hash, generated_at")
+            .eq("topic_id", topic_id)
+            .order("generated_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (lastLabelInputErr) {
+            throw new Error(`last label input_hash lookup failed: ${lastLabelInputErr.message}`);
+          }
+
+          const lastLabelInput = (lastLabelInputRaw ?? null) as LastLabelInputRow | null;
+          label_input_hash_prev = lastLabelInput?.input_hash ?? null;
+
+          const inputHashChanged = !label_input_hash_prev || label_input_hash_prev !== label_input_hash;
+          label_input_hash_changed = inputHashChanged;
+
           const minItems = hasPromoted ? 8 : 6;
 
-          if (items.length >= minItems) {
+          if (items.length < minItems) {
+            label_skip_reason = `too_few_items(min=${minItems}, got=${items.length})`;
+          } else if (!inputHashChanged) {
+            label_skip_reason = "input_hash_unchanged";
+          } else {
             // OpenAI call (retry once with small backoff)
             let ai: Awaited<ReturnType<typeof callOpenAIThreeWords>> | null = null;
             try {
@@ -631,7 +671,7 @@ export async function recomputeOrbs(req: Request, res: Response) {
 
       // 12) Upsert snapshot for UI
       {
-        const keywordsFallback = Array.isArray(snap?.keywords) ? snap!.keywords! : [];
+        const keywordsFallback = Array.isArray(snap?.keywords) ? (snap!.keywords as string[]) : [];
         const keywordsToWrite = promotedWords ?? keywordsFallback;
 
         const { error } = await supabase.from("orb_snapshots").upsert(
@@ -714,6 +754,11 @@ export async function recomputeOrbs(req: Request, res: Response) {
         openai_retry_attempted,
         openai_retry_succeeded,
         label_insert_error,
+
+        label_input_hash_current,
+        label_input_hash_prev,
+        label_input_hash_changed,
+        label_skip_reason,
       });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);

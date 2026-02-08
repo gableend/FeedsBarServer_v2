@@ -27,3 +27,10 @@ Cloud-based ingestion and background processing for FeedsBar.
 - Ingestion is designed to be idempotent
 - Duplicate items are handled via DB constraints
 
+## Orb Pipeline v1
+- Velocity now computed from most recent prior window
+- Time-normalized per-hour velocity added
+- Snapshot velocity capped for UI stability
+- Label cadence tied to orb_labels.generated_at
+- Label promotion semantics hardened
+
