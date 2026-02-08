@@ -3,9 +3,16 @@ import crypto from "crypto";
 import OpenAI from "openai";
 import { createClient } from "@supabase/supabase-js";
 
-const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+}
+if (!OPENAI_API_KEY) {
+  throw new Error("Missing OPENAI_API_KEY");
+}
 
 const PROMPT_VERSION = "orbs-words-v1";
 const MODEL = process.env.ORBS_OPENAI_MODEL || "gpt-4o-mini";
@@ -17,20 +24,50 @@ const SENTIMENT_COLORS: Record<string, string> = {
   green: "#3CCB7F",
 };
 
+type TopicRow = {
+  id: string;
+  name: string;
+  slug: string;
+  orb_color: string | null;
+  cadence_minutes: number | null;
+  is_enabled: boolean;
+  uses_sentiment_color: boolean | null;
+};
+
+type OrbStateCalcRow = {
+  volume: number;
+  diversity: number;
+  top_sources: unknown[];
+  top_items: unknown[];
+  input_hash: string;
+};
+
+type LabelCandidateItem = {
+  id: string;
+  title: string;
+  feed_id: string | null;
+  published_at: string;
+};
+
+type LabelCandidatesRow = {
+  items: LabelCandidateItem[];
+  label_input_hash: string;
+};
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false },
 });
 
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-function alignedWindowEndUtc(date = new Date()): string {
+function alignedWindowEndUtc(date: Date = new Date()): string {
   const ms = date.getTime();
   const fiveMin = 5 * 60 * 1000;
   const aligned = new Date(Math.floor(ms / fiveMin) * fiveMin);
   return aligned.toISOString();
 }
 
-function normalizeTitle(t: string) {
+function normalizeTitle(t: string): string {
   return t.replace(/\s+/g, " ").trim();
 }
 
@@ -38,20 +75,20 @@ function safeThreeWords(raw: string): string[] {
   const cleaned = raw.replace(/\s+/g, " ").trim();
   const parts = cleaned
     .split(/[,|/]/g)
-    .map((s) => s.trim())
-    .filter(Boolean);
+    .map((s: string) => s.trim())
+    .filter((s: string) => Boolean(s));
 
   const words = (parts.length >= 3 ? parts.slice(0, 3) : parts)
-    .map((w) => w.replace(/[^a-zA-Z0-9\- ]/g, "").trim())
-    .filter(Boolean)
+    .map((w: string) => w.replace(/[^a-zA-Z0-9\- ]/g, "").trim())
+    .filter((w: string) => Boolean(w))
     .slice(0, 3);
 
   while (words.length < 3) words.push("…");
-  return words.map((w) => w.toUpperCase());
+  return words.map((w: string) => w.toUpperCase());
 }
 
-function hashWords(words: string[]) {
-  const norm = words.map((w) => w.trim().toUpperCase()).join("|");
+function hashWords(words: string[]): string {
+  const norm = words.map((w: string) => w.trim().toUpperCase()).join("|");
   return crypto.createHash("sha256").update(norm).digest("hex");
 }
 
@@ -60,7 +97,12 @@ async function callOpenAIThreeWords(args: {
   topicSlug: string;
   items: Array<{ title: string; published_at: string; feed_id: string | null }>;
   wantsSentiment: boolean;
-}) {
+}): Promise<{
+  words: string[];
+  sentiment_label: string | null;
+  raw: string;
+  token_estimate: number | null;
+}> {
   const { topicName, topicSlug, items, wantsSentiment } = args;
 
   const bulletList = items
@@ -93,7 +135,10 @@ ${wantsSentiment ? "Line 2: SENTIMENT: red|amber|green" : ""}`;
   });
 
   const text = resp.choices?.[0]?.message?.content?.trim() ?? "";
-  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const lines = text
+    .split("\n")
+    .map((l: string) => l.trim())
+    .filter((l: string) => Boolean(l));
 
   const wordsLine = lines[0] ?? "";
   const words = safeThreeWords(wordsLine);
@@ -101,7 +146,7 @@ ${wantsSentiment ? "Line 2: SENTIMENT: red|amber|green" : ""}`;
   let sentiment_label: string | null = null;
 
   if (wantsSentiment) {
-    const sentLine = lines.find((l) => l.toLowerCase().startsWith("sentiment:"));
+    const sentLine = lines.find((l: string) => l.toLowerCase().startsWith("sentiment:"));
     if (sentLine) {
       const val = sentLine.split(":")[1]?.trim().toLowerCase();
       if (val && ["red", "amber", "green"].includes(val)) sentiment_label = val;
@@ -124,21 +169,22 @@ export async function recomputeOrbs(req: Request, res: Response) {
   await supabase.rpc("fn_item_categories_backfill_recent", { p_hours: 2 });
 
   // 2) Load enabled topics
-  const { data: topics, error: topicsErr } = await supabase
+  const { data: topicsRaw, error: topicsErr } = await supabase
     .from("topics")
     .select("id,name,slug,orb_color,cadence_minutes,is_enabled,uses_sentiment_color")
     .eq("is_enabled", true)
     .order("sort_order", { ascending: true });
 
-  if (topicsErr || !topics) {
+  if (topicsErr || !topicsRaw) {
     return res.status(500).json({ ok: false, error: topicsErr?.message ?? "topics load failed" });
   }
 
-  const results: any[] = [];
+  const topics = topicsRaw as TopicRow[];
+  const results: Array<Record<string, unknown>> = [];
 
   for (const t of topics) {
-    const topic_id = t.id as string;
-    const wantsSentiment = !!t.uses_sentiment_color;
+    const topic_id = t.id;
+    const wantsSentiment = Boolean(t.uses_sentiment_color);
 
     // 3) Create run row (per topic)
     const { data: runRow, error: runErr } = await supabase
@@ -163,20 +209,21 @@ export async function recomputeOrbs(req: Request, res: Response) {
 
     try {
       // 4) State calc (RPC)
-      const { data: stateRows, error: stateErr } = await supabase.rpc("fn_orb_state_calc", {
+      const { data: stateRowsRaw, error: stateErr } = await supabase.rpc("fn_orb_state_calc", {
         p_topic_id: topic_id,
         p_window_end: window_end,
         p_window_minutes: window_minutes,
       });
 
-      if (stateErr || !stateRows?.[0]) throw new Error(stateErr?.message ?? "state calc failed");
+      const stateRows = (stateRowsRaw ?? []) as OrbStateCalcRow[];
+      if (stateErr || !stateRows[0]) throw new Error(stateErr?.message ?? "state calc failed");
 
       const state = stateRows[0];
       const volume = Number(state.volume ?? 0);
       const diversity = Number(state.diversity ?? 0);
       const top_sources = state.top_sources ?? [];
       const top_items = state.top_items ?? [];
-      const state_hash = state.input_hash as string;
+      const state_hash = state.input_hash;
 
       // 5) Upsert orb_state
       await supabase
@@ -208,7 +255,7 @@ export async function recomputeOrbs(req: Request, res: Response) {
         .eq("window_minutes", window_minutes)
         .maybeSingle();
 
-      const prevVol = Number(prevState?.volume ?? 0);
+      const prevVol = Number((prevState as { volume?: number } | null)?.volume ?? 0);
       const velocity = prevVol > 0 ? (volume - prevVol) / Math.max(prevVol, 1) : 0;
 
       await supabase
@@ -226,8 +273,11 @@ export async function recomputeOrbs(req: Request, res: Response) {
         .maybeSingle();
 
       const cadenceMin = Number(t.cadence_minutes ?? 30);
-      const lastUpdatedMs = snap?.updated_at ? new Date(snap.updated_at).getTime() : 0;
-      const timeGateOk = !lastUpdatedMs || (Date.now() - lastUpdatedMs) >= cadenceMin * 60 * 1000;
+      const lastUpdatedMs = (snap as { updated_at?: string } | null)?.updated_at
+        ? new Date((snap as { updated_at: string }).updated_at).getTime()
+        : 0;
+
+      const timeGateOk = !lastUpdatedMs || Date.now() - lastUpdatedMs >= cadenceMin * 60 * 1000;
 
       const changeGateOk =
         Math.abs(velocity) >= 0.35 ||
@@ -236,14 +286,14 @@ export async function recomputeOrbs(req: Request, res: Response) {
       const minVolOk = volume >= 12;
 
       let didLabel = false;
-      let label_status = "stale";
+      let label_status: "stale" | "candidate" | "promoted" = "stale";
       let promotedWords: string[] | null = null;
       let sentiment_label: string | null = null;
-      let output_hash: string | null = snap?.output_hash ?? null;
+      let output_hash: string | null = (snap as { output_hash?: string } | null)?.output_hash ?? null;
 
       if (timeGateOk && changeGateOk && minVolOk) {
         // 7) Candidate selection
-        const { data: candRows, error: candErr } = await supabase.rpc("fn_orb_label_candidates", {
+        const { data: candRowsRaw, error: candErr } = await supabase.rpc("fn_orb_label_candidates", {
           p_topic_id: topic_id,
           p_window_end: window_end,
           p_window_minutes: window_minutes,
@@ -251,10 +301,12 @@ export async function recomputeOrbs(req: Request, res: Response) {
           p_max_per_feed: 2,
         });
 
-        if (!candErr && candRows?.[0]) {
+        const candRows = (candRowsRaw ?? []) as LabelCandidatesRow[];
+
+        if (!candErr && candRows[0]) {
           const cand = candRows[0];
-          const items = (cand.items ?? []) as any[];
-          const label_input_hash = cand.label_input_hash as string;
+          const items = (cand.items ?? []) as LabelCandidateItem[];
+          const label_input_hash = cand.label_input_hash;
 
           if (items.length >= 8) {
             // 8) OpenAI call
@@ -296,9 +348,11 @@ export async function recomputeOrbs(req: Request, res: Response) {
                 .order("generated_at", { ascending: false })
                 .limit(2);
 
-              if (lastTwo && lastTwo.length === 2 && lastTwo[0].output_hash === lastTwo[1].output_hash) {
-                await supabase.from("orb_labels").update({ status: "promoted" }).eq("id", lastTwo[0].id);
-                await supabase.from("orb_labels").update({ status: "rejected" }).eq("id", lastTwo[1].id);
+              const last = (lastTwo ?? []) as Array<{ id: string; output_hash: string }>;
+
+              if (last.length === 2 && last[0].output_hash === last[1].output_hash) {
+                await supabase.from("orb_labels").update({ status: "promoted" }).eq("id", last[0].id);
+                await supabase.from("orb_labels").update({ status: "rejected" }).eq("id", last[1].id);
 
                 promotedWords = words;
                 sentiment_label = ai.sentiment_label;
@@ -323,17 +377,20 @@ export async function recomputeOrbs(req: Request, res: Response) {
           .limit(1)
           .maybeSingle();
 
-        if (prom?.words?.length === 3) {
-          promotedWords = prom.words;
-          sentiment_label = prom.sentiment_label ?? null;
-          output_hash = prom.output_hash ?? output_hash;
+        const p = prom as { words?: string[]; sentiment_label?: string | null; output_hash?: string | null } | null;
+        if (p?.words?.length === 3) {
+          promotedWords = p.words;
+          sentiment_label = p.sentiment_label ?? null;
+          output_hash = p.output_hash ?? output_hash;
           label_status = "promoted";
         }
       }
 
       const resting_color = t.orb_color ?? "#999999";
       const display_color = wantsSentiment
-        ? (sentiment_label ? (SENTIMENT_COLORS[sentiment_label.toLowerCase()] ?? resting_color) : resting_color)
+        ? sentiment_label
+          ? SENTIMENT_COLORS[sentiment_label.toLowerCase()] ?? resting_color
+          : resting_color
         : resting_color;
 
       // 12) Upsert snapshot for UI
@@ -342,7 +399,7 @@ export async function recomputeOrbs(req: Request, res: Response) {
         .upsert(
           {
             topic_id,
-            keywords: promotedWords ?? (snap?.keywords ?? []),
+            keywords: promotedWords ?? ((snap as { keywords?: string[] } | null)?.keywords ?? []),
             sentiment_label,
             sentiment_score: null,
             summary: null,
@@ -375,20 +432,21 @@ export async function recomputeOrbs(req: Request, res: Response) {
         .eq("id", run_id);
 
       results.push({ topic_id, ok: true, volume, diversity, velocity, didLabel, label_status });
-    } catch (e: any) {
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+
       await supabase
         .from("orb_runs")
         .update({
           status: "error",
-          error_message: e?.message ?? String(e),
+          error_message: msg,
           finished_at: new Date().toISOString(),
         })
         .eq("id", run_id);
 
-      results.push({ topic_id, ok: false, error: e?.message ?? String(e) });
+      results.push({ topic_id, ok: false, error: msg });
     }
   }
 
   res.json({ ok: true, window_end, window_minutes, topics: topics.length, results });
 }
-
